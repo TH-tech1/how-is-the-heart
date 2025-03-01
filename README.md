@@ -1,4 +1,4 @@
 group members:
-Meenambiga Velmurugan
-Syed Muhammad Bilal
+Meenambiga Velmurugan,
+Syed Muhammad Bilal,
 Ayham Taha
