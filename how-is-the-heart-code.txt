@@ -1,0 +1,246 @@
+#include <WiFi.h>
+#include <WebServer.h>
+
+// Wi-Fi credentials
+const char* ssid = "";
+const char* password = "";
+
+WebServer server(80);
+
+// Define pins for AD8232
+#define ECG_PIN 36       // GPIO36 (VP) to read ECG signal
+#define LO_Minus_PIN 25  // GPIO25 for lead-off detection (-)
+#define LO_Plus_PIN 26   // GPIO26 for lead-off detection (+)
+
+// Variables for signal processing
+int analogValue = 0;             // Raw analog value
+float filteredECG = 0;           // Filtered ECG signal
+int smoothedValue = 0;           // Smoothed signal for peak detection
+const int filterSize = 10;       // Window size for moving average filter
+int filterBuffer[filterSize];    // Buffer for moving average filter
+int bufferIndex = 0;
+
+// BPM Calculation Variables
+const int maxIntervals = 10;     // Number of intervals for averaging
+unsigned long peakIntervals[maxIntervals]; // Array to store peak intervals
+int intervalIndex = 0;           // Index for rolling intervals
+int bpm = 0;                     // Heart rate (beats per minute)
+unsigned long lastPeakTime = 0;  // Timestamp of the last detected peak
+unsigned long currentTime = 0;   // Current time for interval calculation
+
+// Timer for periodic updates
+unsigned long lastUpdateTime = 0; // Last update time for BPM display
+const unsigned long updateInterval = 100; // Update BPM every 100ms
+
+// Filter coefficients
+float prevLowPassOutput = 0;
+float prevHighPassOutput = 0;
+float prevLowPassInput = 0;
+float prevHighPassInput = 0;
+
+// Initialize filter buffer
+void initializeFilterBuffer() {
+  for (int i = 0; i < filterSize; i++) {
+    filterBuffer[i] = 0;
+  }
+  for (int i = 0; i < maxIntervals; i++) {
+    peakIntervals[i] = 0;
+  }
+}
+
+// Low-pass filter
+float lowPassFilter(float input) {
+  const float alpha = 0.1; // Adjust alpha for cutoff frequency
+  float output = alpha * input + (1 - alpha) * prevLowPassOutput;
+  prevLowPassOutput = output;
+  prevLowPassInput = input;
+  return output;
+}
+
+// High-pass filter
+float highPassFilter(float input) {
+  const float alpha = 0.99; // Adjust alpha for cutoff frequency
+  float output = alpha * (prevHighPassOutput + input - prevHighPassInput);
+  prevHighPassOutput = output;
+  prevHighPassInput = input;
+  return output;
+}
+
+// Apply moving average filter
+int applyMovingAverageFilter(float value) {
+  filterBuffer[bufferIndex] = value;
+  bufferIndex = (bufferIndex + 1) % filterSize;
+
+  long sum = 0;
+  for (int i = 0; i < filterSize; i++) {
+    sum += filterBuffer[i];
+  }
+  return sum / filterSize;
+}
+
+// Update BPM using rolling average
+void updateBPM(unsigned long interval) {
+  peakIntervals[intervalIndex] = interval; // Store the current interval
+  intervalIndex = (intervalIndex + 1) % maxIntervals; // Move to the next index
+
+  // Calculate average interval
+  unsigned long sumIntervals = 0;
+  int count = 0;
+  for (int i = 0; i < maxIntervals; i++) {
+    if (peakIntervals[i] > 0) {
+      sumIntervals += peakIntervals[i];
+      count++;
+    }
+  }
+
+  // Calculate BPM from average interval
+  if (count > 0) {
+    unsigned long avgInterval = sumIntervals / count;
+    bpm = 60000 / avgInterval; // Convert interval to BPM
+    if (bpm < 40 || bpm > 200) {
+      bpm = 0; // Reset BPM if outside realistic range
+    }
+  }
+}
+
+// Handle JSON data for ECG and BPM
+void handleData() {
+  bool irregular = (bpm < 60 || bpm > 100); // Define irregular BPM
+  String jsonData = "{\"ecg\":" + String(smoothedValue) + 
+                    ",\"bpm\":" + String(bpm) + 
+                    ",\"irregular\":" + (irregular ? "true" : "false") + "}";
+  
+  // If irregular BPM, print alert on Serial Monitor
+  if (irregular) {
+    Serial.println("Alert! Irregular Heart Rate Detected!");
+    Serial.println(WiFi.localIP());
+  }
+  
+  server.send(200, "application/json", jsonData);
+}
+
+// Serve HTML with Chart.js
+void handleHTML() {
+  String htmlPage = R"rawliteral(
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>Heart Rate Monitor</title>
+      <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+      <style>
+        .alert {
+          color: red;
+          font-weight: bold;
+        }
+        .bpm {
+          font-size: 24px;
+        }
+      </style>
+    </head>
+    <body>
+      <h1>Heart Rate Monitor</h1>
+      <div id="alertMessage" class="alert" style="display:none;">Irregular Heart Rate Detected!</div>
+      <div class="bpm">Current BPM: <span id="bpmValue">0</span></div>
+      <canvas id="ecgChart" width="400" height="200"></canvas>
+      <script>
+        const ctx = document.getElementById('ecgChart').getContext('2d');
+        const ecgChart = new Chart(ctx, {
+          type: 'line',
+          data: {
+            labels: Array(100).fill(''),
+            datasets: [{
+              label: 'ECG Signal',
+              data: Array(100).fill(0),
+              borderColor: 'rgb(75, 192, 192)',
+              tension: 0.1
+            }]
+          },
+          options: {
+            scales: {
+              x: { display: false },
+              y: { beginAtZero: true }
+            }
+          }
+        });
+
+        async function fetchData() {
+          const response = await fetch('/data');
+          const data = await response.json();
+          const ecgData = data.ecg;
+          const bpmValue = data.bpm;
+          const isIrregular = data.irregular;
+
+          // Update ECG chart
+          ecgChart.data.datasets[0].data.shift();
+          ecgChart.data.datasets[0].data.push(ecgData);
+          ecgChart.update();
+
+          // Update BPM value
+          document.getElementById('bpmValue').textContent = bpmValue;
+
+          // Show or hide irregular heart rate alert
+          const alertMessage = document.getElementById('alertMessage');
+          if (isIrregular) {
+            alertMessage.style.display = 'block';
+          } else {
+            alertMessage.style.display = 'none';
+          }
+        }
+
+        setInterval(fetchData, 100);
+      </script>
+    </body>
+    </html>
+  )rawliteral";
+  server.send(200, "text/html", htmlPage);
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  // Initialize pins
+  pinMode(ECG_PIN, INPUT);
+  pinMode(LO_Plus_PIN, INPUT);
+  pinMode(LO_Minus_PIN, INPUT);
+  Serial.println("hhhh");
+  initializeFilterBuffer();
+
+  // Connect to Wi-Fi
+  Serial.println("Connecting to Wi-Fi...");
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nConnected to Wi-Fi!");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+
+  // Configure web server
+  server.on("/", handleHTML);
+  server.on("/data", handleData);
+  server.begin();
+  Serial.println("Web server started!");
+}
+
+void loop() {
+  server.handleClient();
+
+  // ECG Processing
+  analogValue = analogRead(ECG_PIN);
+  filteredECG = lowPassFilter(analogValue);
+  filteredECG = highPassFilter(filteredECG);
+  smoothedValue = applyMovingAverageFilter(filteredECG);
+
+  // Detect peaks for BPM
+  if (smoothedValue > 2500 && (millis() - lastPeakTime > 300)) {
+    currentTime = millis();
+    unsigned long interval = currentTime - lastPeakTime;
+    lastPeakTime = currentTime;
+    updateBPM(interval);
+  }
+
+  delay(10);
+}
